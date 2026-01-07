@@ -25,6 +25,9 @@ class Camera:
         self.mediamtx_api = os.getenv("MEDIAMTX_API", "http://127.0.0.1:9997")
         self.last_rtsp_ok = 0
         self.rtsp_check_interval = 5
+        self.rtsp_failures = 0
+        self.rtsp_failure_limit = 3
+        self.restart_lock = threading.Lock()
 
         self.start_time = time.time()
         self.last_frame_time = None
@@ -49,6 +52,36 @@ class Camera:
         signal.signal(signal.SIGTERM, self._signal_handler)
         atexit.register(self.stop)
 
+
+    def _restart_camera(self):
+        with self.restart_lock:
+            try:
+                self.stop()
+                time.sleep(2)
+                self.picam = Picamera2(self.camera_index)
+                self.picam.configure(self.video_config)
+                self.start()
+            except Exception as e:
+                print(f"[FATAL] Camera restart failed: {e}")
+
+    def _rtsp_watchdog(self):
+        while self.running:
+            ok = self.check_rtsp()
+
+            if ok:
+                self.rtsp_failures = 0
+            else:
+                self.rtsp_failures += 1
+                print(f"[WARN] RTSP not visible ({self.rtsp_failures})")
+
+                if self.rtsp_failures >= self.rtsp_failure_limit:
+                    print("[ERROR] RTSP stalled — restarting camera")
+                    self._restart_camera()
+                    self.rtsp_failures = 0
+
+            time.sleep(self.rtsp_check_interval)
+
+        
     def health_payload(self):
         return {
             "running": self.running,
