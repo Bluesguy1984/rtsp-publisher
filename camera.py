@@ -29,6 +29,11 @@ class Camera:
         self.rtsp_failure_limit = 3
         self.restart_lock = threading.Lock()
 
+        self.rtsp_failures = 0
+        self.max_rtsp_failures = 3
+        self.rtsp_restart_delay = 3
+        self.last_rtsp_seen = time.time()
+
         self.start_time = time.time()
         self.last_frame_time = None
         
@@ -64,23 +69,59 @@ class Camera:
             except Exception as e:
                 print(f"[FATAL] Camera restart failed: {e}")
 
+                
+    def _start_rtsp(self):
+        self.h264_encoder = H264Encoder(bitrate=6_000_000)
+        self.rtsp_output = PyavOutput(
+            "rtsp://127.0.0.1:8554/camera",
+            format="rtsp",
+            options={
+                "rtsp_transport": "tcp",
+                "fflags": "nobuffer"
+            }
+        )
+        self.picam.start_recording(self.h264_encoder, self.rtsp_output)
+
+
+    def _stop_rtsp(self):
+        try:
+            self.picam.stop_recording()
+        except Exception:
+            pass
+
+
     def _rtsp_watchdog(self):
         while self.running:
             ok = self.check_rtsp()
 
             if ok:
+                self.last_rtsp_seen = time.time()
                 self.rtsp_failures = 0
             else:
-                self.rtsp_failures += 1
-                print(f"[WARN] RTSP not visible ({self.rtsp_failures})")
+                if time.time() - self.last_rtsp_seen > self.rtsp_check_interval:
+                    self.rtsp_failures += 1
+                    print(f"[WARN] RTSP not visible ({self.rtsp_failures})")
 
-                if self.rtsp_failures >= self.rtsp_failure_limit:
-                    print("[ERROR] RTSP stalled — restarting camera")
-                    self._restart_camera()
-                    self.rtsp_failures = 0
+                    if self.rtsp_failures >= self.max_rtsp_failures:
+                        print("[ERROR] RTSP unhealthy, restarting pipeline")
+                        self._restart_rtsp_pipeline()
 
             time.sleep(self.rtsp_check_interval)
 
+
+        def _restart_rtsp_pipeline(self):
+            try:
+                self._stop_rtsp()
+                time.sleep(self.rtsp_restart_delay)
+                self._start_rtsp()
+                self.last_rtsp_seen = time.time()
+                self.rtsp_failures = 0
+                print("[INFO] RTSP pipeline restarted successfully")
+            except Exception as e:
+                print(f"[FATAL] RTSP restart failed: {e}")
+                self.stop()
+                raise SystemExit(1)
+            
         
     def health_payload(self):
         return {
@@ -89,7 +130,8 @@ class Camera:
             "camera_name": self.camera_name,
             "uptime": int(time.time() - self.start_time),
         }
-        
+
+    
     def is_healthy(self):
         if not self.running:
             return False
@@ -98,6 +140,7 @@ class Camera:
         uptime = time.time() - self.start_time
         return uptime > 2  # give camera time to start
 
+    
     def check_rtsp(self) -> bool:
         try:
             r = requests.get(f"{self.mediamtx_api}/v3/paths/list", timeout=2)
@@ -113,6 +156,7 @@ class Camera:
         except Exception:
             return False
 
+        
     def _rtsp_watchdog(self):
         while self.running:
             ok = self.check_rtsp()
@@ -120,39 +164,42 @@ class Camera:
                 print("[WARN] RTSP stream not visible to MediaMTX")
                 time.sleep(self.rtsp_check_interval)
 
-        
     def start(self):
         if self.running:
             return
+
         try:
             self.picam.start()
-            self.picam.start_recording(self.h264_encoder, self.rtsp_output)
+            self._start_rtsp()
             self.running = True
 
             threading.Thread(
                 target=self._rtsp_watchdog,
                 daemon=True
             ).start()
-            
+
             self.start_health_server()
-            
+
             while True:
-                time.sleep(1.0)
+                time.sleep(1)
         except Exception:
             self.stop()
             raise
 
-    def start_health_server(self, host="0.0.0.0", port=9188):
-        from flask import Flask, jsonify
 
+    def start_health_server(self, host="0.0.0.0", port=9188):
         app = Flask(__name__)
-        camera = self  # closure capture
+        camera = self  # capture reference safely
 
         @app.route("/health", methods=["GET"])
         def health():
-            if not camera.is_healthy():
-                return jsonify(camera.health_payload()), 503
-            return jsonify(camera.health_payload()), 200
+            healthy = camera.is_healthy()
+            return jsonify({
+                "running": camera.running,
+                "rtsp_visible": camera.check_rtsp(),
+                "last_rtsp_seen": int(time.time() - camera.last_rtsp_seen),
+                "camera": camera.camera_name,
+            }), 200 if healthy else 500
 
         thread = threading.Thread(
             target=app.run,
@@ -165,7 +212,8 @@ class Camera:
             daemon=True,
         )
         thread.start()
-
+        
+        
     def stop(self):
         if not self.running:
             return
@@ -183,6 +231,7 @@ class Camera:
             pass
         self.running = False
 
+        
     def _signal_handler(self, signum, frame):
         self.stop()
         raise SystemExit
