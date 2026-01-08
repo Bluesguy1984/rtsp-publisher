@@ -188,6 +188,7 @@ class Camera:
 
 
     def start_health_server(self, host="0.0.0.0", port=9188):
+        from flask import Flask, jsonify
         app = Flask(__name__)
         camera = self  # capture reference safely
 
