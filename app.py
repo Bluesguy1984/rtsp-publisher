@@ -6,6 +6,14 @@ def create_app(camera):
 
     @app.route("/health")
     def health():
-        return jsonify(camera.health_status())
+        if camera.is_healthy():
+            return "OK", 200
+        else:
+            return "FAIL", 500
 
+    @app.route("/health/details")
+    def health_details():
+        return camera.health_status(), 200
+
+        
     return app
