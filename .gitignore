@@ -3,3 +3,7 @@
 *.py~
 *.yml~
 Dockerfile~
+camera.py1
+*.pyc
+*.log
+*.txt
